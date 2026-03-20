@@ -10,13 +10,9 @@ import sys
 import time
 from urllib.parse import urljoin, urlparse
 
-import requests
+from curl_cffi import requests
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-TIMEOUT = 15
+TIMEOUT = 30
 
 AI_BOTS = [
     "GPTBot", "ChatGPT-User", "ClaudeBot", "Claude-Web", "CCBot",
@@ -37,6 +33,8 @@ FIELDNAMES = [
     "ai_bot_blocks",
     "has_llms_txt",
     "bot_detection",
+    "http_fallback",
+    "bad_ssl",
     "error",
 ]
 
@@ -48,18 +46,27 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def fetch(url: str, session: requests.Session) -> tuple[requests.Response | None, int]:
-    """Returns (response, latency_ms)."""
+def fetch(url: str, session: requests.Session, verify: bool = True) -> tuple[requests.Response | None, int, str, bool]:
+    """Returns (response, latency_ms, error_reason, bad_ssl)."""
     try:
         start = time.monotonic()
-        resp = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        resp = session.get(url, timeout=TIMEOUT, allow_redirects=True, verify=verify)
         latency = int((time.monotonic() - start) * 1000)
-        # Fix encoding: if the server didn't declare a charset, use detected encoding
-        if resp.encoding and resp.encoding.lower() == "iso-8859-1" and "charset" not in resp.headers.get("Content-Type", "").lower():
-            resp.encoding = resp.apparent_encoding
-        return resp, latency
-    except requests.RequestException:
-        return None, 0
+        return resp, latency, "", not verify
+    except requests.errors.RequestsError as e:
+        msg = str(e)
+        # Retry with verify=False on SSL errors
+        if verify and "ssl" in msg.lower():
+            return fetch(url, session, verify=False)
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            return None, 0, "Connection timed out", False
+        if "ssl" in msg.lower():
+            return None, 0, "SSL error", True
+        if "connection" in msg.lower():
+            return None, 0, "Connection refused", False
+        return None, 0, msg, False
+    except Exception as e:
+        return None, 0, str(e), False
 
 
 def extract_title(page_html: str) -> str:
@@ -120,7 +127,7 @@ def detect_bot_protection(resp: requests.Response) -> list[str]:
     if "x-iinfo" in headers:
         detections.append("Imperva/Incapsula")
     if resp.cookies and any(
-        c.name.startswith("visid_incap") for c in resp.cookies
+        name.startswith("visid_incap") for name in resp.cookies.keys()
     ):
         detections.append("Imperva/Incapsula (cookie)")
 
@@ -170,12 +177,28 @@ def scan_site(url: str, session: requests.Session, data_dir: str) -> dict:
     origin = f"{parsed.scheme}://{parsed.netloc}"
     domain = parsed.netloc
 
-    # Homepage
-    resp, latency = fetch(base, session)
+    # Homepage — try variants: https, https+www, http, http+www
+    resp, latency, err, bad_ssl = fetch(base, session)
+    if resp is None:
+        variants = []
+        if not domain.startswith("www."):
+            variants.append(f"{parsed.scheme}://www.{domain}")
+        if parsed.scheme == "https":
+            variants.append(f"http://{domain}")
+            if not domain.startswith("www."):
+                variants.append(f"http://www.{domain}")
+        for variant in variants:
+            resp, latency, err, bad_ssl = fetch(variant, session)
+            if resp is not None:
+                row["http_fallback"] = "yes" if variant.startswith("http://") else ""
+                origin = variant
+                break
     if resp is None:
         row["status"] = "error"
-        row["error"] = "Failed to connect"
+        row["error"] = err or "Failed to connect"
         return row
+    if bad_ssl:
+        row["bad_ssl"] = "yes"
 
     row["status_code"] = resp.status_code
     row["latency_ms"] = latency
@@ -185,7 +208,7 @@ def scan_site(url: str, session: requests.Session, data_dir: str) -> dict:
     detections = detect_bot_protection(resp)
 
     # robots.txt
-    robots_resp, _ = fetch(urljoin(origin, "/robots.txt"), session)
+    robots_resp, _, _, _ = fetch(urljoin(origin, "/robots.txt"), session)
     if robots_resp and robots_resp.status_code == 200 and robots_resp.text.strip():
         content = robots_resp.text.strip()
         if content.lower().startswith(("<!doctype", "<html", "<head")):
@@ -198,7 +221,7 @@ def scan_site(url: str, session: requests.Session, data_dir: str) -> dict:
         row["has_robots_txt"] = "no"
 
     # llms.txt
-    llms_resp, _ = fetch(urljoin(origin, "/llms.txt"), session)
+    llms_resp, _, _, _ = fetch(urljoin(origin, "/llms.txt"), session)
     if llms_resp and llms_resp.status_code == 200 and llms_resp.text.strip():
         content = llms_resp.text.strip()
         # Reject soft 404s: if it looks like HTML, it's not a real llms.txt
@@ -242,14 +265,20 @@ def main():
 
     print(f"Scanning {len(rows)} sites...")
 
-    session = requests.Session()
-    session.headers["User-Agent"] = USER_AGENT
+    session = requests.Session(impersonate="chrome")
 
     results = []
     for i, input_row in enumerate(rows, 1):
         url = input_row["url"]
-        print(f"  [{i}/{len(rows)}] {url}")
+        print(f"  [{i}/{len(rows)}] {url}", end=" ... ", flush=True)
         result = scan_site(url, session, data_dir)
+        status = result["status"]
+        if status == "error":
+            print(f"error ({result['error']})")
+        elif status == "blocked":
+            print(f"blocked ({result['bot_detection']})")
+        else:
+            print(status)
         # Pass through extra columns from input
         for k in extra_keys:
             result[k] = input_row.get(k, "")
@@ -260,7 +289,17 @@ def main():
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"Done. Results written to {args.output}")
+    total = len(results)
+    ok = sum(1 for r in results if r["status"] == "ok")
+    blocked = sum(1 for r in results if r["status"] == "blocked")
+    errors = sum(1 for r in results if r["status"] == "error")
+    other = total - ok - blocked - errors
+    has_robots = sum(1 for r in results if r["has_robots_txt"] == "yes")
+    has_llms = sum(1 for r in results if r["has_llms_txt"] == "yes")
+    has_ai_blocks = sum(1 for r in results if r["ai_bot_blocks"])
+    print(f"\nDone. Results written to {args.output}")
+    print(f"  {ok}/{total} ok, {blocked} blocked, {errors} errors" + (f", {other} other" if other else ""))
+    print(f"  {has_robots} robots.txt, {has_llms} llms.txt, {has_ai_blocks} blocking AI bots")
 
 
 if __name__ == "__main__":

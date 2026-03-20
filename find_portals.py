@@ -6,19 +6,14 @@ import csv
 import sys
 import time
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 
 def find_portal_url(country: str, ddgs: DDGS) -> str | None:
     """Search for the official government portal of a country."""
-    query = f'{country} government portal'
+    query = f"{country} government portal"
     try:
         results = ddgs.text(query, max_results=5)
-        # Prefer .gov/.gob/.gouv domains
-        for r in results:
-            url = r["href"]
-            if ".gov" in url or ".gob" in url or ".gouv" in url:
-                return url
         return results[0]["href"] if results else None
     except Exception as e:
         print(f"    Error searching for {country}: {e}", file=sys.stderr)
