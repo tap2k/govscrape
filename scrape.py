@@ -7,7 +7,9 @@ import html
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
@@ -248,6 +250,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scan websites for reachability and bot detection")
     parser.add_argument("--input", "-i", required=True, help="Input CSV with 'url' column")
     parser.add_argument("--output", "-o", default="results.csv", help="Output CSV path")
+    parser.add_argument("--workers", "-w", type=int, default=1, help="Number of concurrent workers (default: 1)")
     args = parser.parse_args()
 
     with open(args.input, newline="") as f:
@@ -263,29 +266,44 @@ def main():
     data_dir = os.path.join(os.path.dirname(args.output) or ".", "data")
     os.makedirs(data_dir, exist_ok=True)
 
-    print(f"Scanning {len(rows)} sites...")
+    print(f"Scanning {len(rows)} sites with {args.workers} worker(s)...")
 
-    session = requests.Session(impersonate="chrome")
+    print_lock = threading.Lock()
+    counter = {"done": 0}
 
-    results = []
-    for i, input_row in enumerate(rows, 1):
+    def process_row(input_row):
+        session = requests.Session(impersonate="chrome")
         url = input_row["url"]
-        print(f"  [{i}/{len(rows)}] {url}", end=" ... ", flush=True)
         result = scan_site(url, session, data_dir)
-        status = result["status"]
-        if status == "error":
-            print(f"error ({result['error']})")
-        elif status == "blocked":
-            print(f"blocked ({result['bot_detection']})")
-        else:
-            print(status)
         # Pass through extra columns from input
         for k in extra_keys:
             result[k] = input_row.get(k, "")
-        results.append(result)
+        with print_lock:
+            counter["done"] += 1
+            i = counter["done"]
+            status = result["status"]
+            if status == "error":
+                print(f"  [{i}/{len(rows)}] {url} ... error ({result['error']})")
+            elif status == "blocked":
+                print(f"  [{i}/{len(rows)}] {url} ... blocked ({result['bot_detection']})")
+            else:
+                print(f"  [{i}/{len(rows)}] {url} ... {status}")
+        return input_row, result
 
+    results_map = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(process_row, row): idx for idx, row in enumerate(rows)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            _, result = future.result()
+            results_map[idx] = result
+
+    # Preserve original input order
+    results = [results_map[i] for i in range(len(rows))]
+
+    output_fields = FIELDNAMES + [k for k in extra_keys if k not in FIELDNAMES]
     with open(args.output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=output_fields)
         writer.writeheader()
         writer.writerows(results)
 
