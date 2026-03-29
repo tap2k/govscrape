@@ -74,43 +74,56 @@ def main():
             continue
 
         country = country_dir.replace("_", " ")
-        all_urls = []
 
+        # Extract URLs per source LLM
+        source_urls: dict[str, list[str]] = {}
         for filename in os.listdir(country_path):
             if filename.startswith("chat_") and filename.endswith(".html"):
+                source = filename.removeprefix("chat_").removesuffix(".html")
                 filepath = os.path.join(country_path, filename)
-                all_urls.extend(extract_urls_from_file(filepath))
+                source_urls[source] = extract_urls_from_file(filepath)
 
-        # Group by domain, pick canonical URL (scheme + netloc)
-        domain_counts: Counter[str] = Counter()
+        # Group by (domain, source)
+        key_counts: Counter[tuple[str, str]] = Counter()
         domain_to_url: dict[str, str] = {}
 
-        for url in all_urls:
-            try:
-                parsed = urlparse(url)
-            except ValueError:
-                continue
-            domain = domain_root(url)
-            if not domain or "." not in domain or should_skip(domain):
-                continue
-            domain_counts[domain] += 1
-            if domain not in domain_to_url:
-                domain_to_url[domain] = f"{parsed.scheme}://{parsed.netloc}"
+        for source, urls in source_urls.items():
+            for url in urls:
+                try:
+                    parsed = urlparse(url)
+                except ValueError:
+                    continue
+                domain = domain_root(url)
+                if not domain or "." not in domain or should_skip(domain):
+                    continue
+                key_counts[(domain, source)] += 1
+                if domain not in domain_to_url:
+                    domain_to_url[domain] = f"{parsed.scheme}://{parsed.netloc}"
 
-        # Output one row per unique domain, ranked by mention count
-        if domain_counts:
-            for domain, count in domain_counts.most_common():
-                url = domain_to_url[domain]
-                results.append({"country": country, "url": url, "mentions": count})
-            top = domain_counts.most_common(1)[0]
-            print(f"  {country}: {len(domain_counts)} domains (top: {top[0]}, {top[1]}x)")
+        # One row per unique domain, with per-model mention counts
+        if key_counts:
+            domain_totals: Counter[str] = Counter()
+            for (domain, source), count in key_counts.items():
+                domain_totals[domain] += count
+
+            all_sources = sorted(source_urls.keys())
+            for domain, total in domain_totals.most_common():
+                row = {"country": country, "url": domain_to_url[domain], "mentions": total}
+                for source in all_sources:
+                    row[source] = key_counts.get((domain, source), 0)
+                results.append(row)
+
+            top_domain = domain_totals.most_common(1)[0]
+            print(f"  {country}: {len(domain_totals)} domains (top: {top_domain[0]}, {top_domain[1]}x)")
         else:
             results.append({"country": country, "url": "", "mentions": 0})
             print(f"  {country}: NO URLS FOUND")
 
     output = "extracted_portals.csv"
     with open(output, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["country", "url", "mentions"])
+        # Detect all source columns from the data
+        source_cols = sorted({k for r in results for k in r if k not in ("country", "url", "mentions")})
+        writer = csv.DictWriter(f, fieldnames=["country", "url", "mentions"] + source_cols)
         writer.writeheader()
         writer.writerows(results)
 
